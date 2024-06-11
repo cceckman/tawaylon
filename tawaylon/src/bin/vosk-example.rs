@@ -1,21 +1,26 @@
 use vosk::Model;
 use vosk::Recognizer;
 
-fn main() {
-    let samples = vec![100, -2, 700, 30, 4, 5];
-    let model_path = "/path/to/model";
+fn audio_samples() -> rodio::Decoder<std::io::Cursor<&'static [u8]>> {
+    const SAMPLE_BYTES: &[u8] = include_bytes!("mono.wav");
+    let cursor = std::io::Cursor::new(SAMPLE_BYTES);
+    rodio::decoder::Decoder::new(cursor).unwrap()
+}
 
-    let model = Model::new(model_path).unwrap();
-    let mut recognizer = Recognizer::new(&model, 16000.0).unwrap();
+fn main() {
+    let samples: Vec<i16> = audio_samples().collect();
+    let model_path = "/home/cceckman/r/github.com/cceckman/tawaylon/models/vosk-small.dir";
+
+    let mut model = Model::new(model_path).unwrap();
+    model.find_word("hello").expect("could not find hello");
+    model.find_word("world").expect("could not find world");
+
+    let mut recognizer = Recognizer::new(&model, 44100.0).unwrap();
 
     recognizer.set_max_alternatives(10);
     recognizer.set_words(true);
-    recognizer.set_partial_words(true);
+    recognizer.set_partial_words(false);
 
-    for sample in samples.chunks(100) {
-        recognizer.accept_waveform(sample);
-        println!("{:#?}", recognizer.partial_result());
-    }
-
+    recognizer.accept_waveform(&samples);
     println!("{:#?}", recognizer.final_result().multiple().unwrap());
 }

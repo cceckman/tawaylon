@@ -1,5 +1,6 @@
 
-redo-ifchange vosk-example
+redo-ifchange vosk-example ../models/vosk-small
 
 export LD_LIBRARY_PATH="$(pwd)/../venv/lib/python3.11/site-packages/vosk"
-./vosk-example
+./vosk-example >&2
+
