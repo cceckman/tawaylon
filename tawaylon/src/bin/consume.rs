@@ -13,7 +13,12 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::*;
 
 const SAMPLE_RATE: SampleRate = SampleRate(16_000);
 
-const GRAMMAR: &[&str] = &["air", "bat", "cap", "wake", "sleep", "click"];
+const GRAMMAR: &[&str] = &[
+    "air", "bat", "cap", "drum", "each", "fine", "gust", "harp", "sit", "jury",
+    /* nit: they don't have "krunch" in their model, we have to misspell it */ "crunch",
+    "look", "made", "near", "odd", "pit", "quench", "red", "sun", "trap", "urge", "vest", "whale",
+    "plex", "yank", "zip", "wake", "sleep", "click",
+];
 
 // Wholeheartedly from https://github.com/mora-unie-youer/wayland-idle-inhibitor/blob/master/src/daemon/state.rs
 struct Insomniac {
