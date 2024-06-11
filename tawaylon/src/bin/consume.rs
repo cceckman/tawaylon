@@ -22,7 +22,6 @@ const GRAMMAR: &[&str] = &[
 
 // Wholeheartedly from https://github.com/mora-unie-youer/wayland-idle-inhibitor/blob/master/src/daemon/state.rs
 struct Insomniac {
-    pub terminate: Arc<AtomicBool>,
     queue_handle: QueueHandle<Self>,
 
     base_surface: Option<wl_surface::WlSurface>,
@@ -33,7 +32,6 @@ struct Insomniac {
 impl Insomniac {
     pub fn new(event_queue: &mut EventQueue<Self>) -> Self {
         let mut state = Self {
-            terminate: Arc::new(AtomicBool::new(false)),
             queue_handle: event_queue.handle(),
 
             base_surface: None,

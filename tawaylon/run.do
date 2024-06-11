@@ -1,6 +1,6 @@
 
-redo-ifchange consume.bin ../models/vosk-small
+redo-ifchange consume.bin ../models/vosk-small ../lib/libvosk.so
 
-export LD_LIBRARY_PATH="$(pwd)/../venv/lib/python3.11/site-packages/vosk"
+export LD_LIBRARY_PATH="$(pwd)/../lib"
 ./consume.bin >&2
 
