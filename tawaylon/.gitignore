@@ -1,4 +1,4 @@
 target/**
 .redo/
-vosk-example
+*.bin
 
