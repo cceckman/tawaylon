@@ -7,17 +7,30 @@ use vosk::{CompleteResult, Model, Recognizer};
 
 const SAMPLE_RATE: SampleRate = SampleRate(16_000);
 
+const GRAMMAR: &[&str] = &[
+    "air", "bat", "cap", "drum", "each", "fine", "gust", "harp", "sit", "jury",
+    /* nit: they don't have "krunch" in their model, we have to misspell it */ "crunch",
+    "look", "made", "near", "odd", "pit", "quench", "red", "sun", "trap", "urge", "vest", "whale",
+    "plex", "yank", "zip",
+];
+
 struct Robot {
     recog: Recognizer,
 }
 
 impl Robot {
-    fn new() -> Self {
+    fn new(words: &[impl AsRef<str>]) -> Self {
         let model_path = "/home/cceckman/r/github.com/cceckman/tawaylon/models/vosk-small.dir";
 
-        let model = Model::new(model_path).unwrap();
+        let mut model = Model::new(model_path).unwrap();
+        for word in words {
+            if model.find_word(word.as_ref()).is_none() {
+                panic!("word {} not found in the model", word.as_ref())
+            }
+        }
 
-        let mut recognizer = Recognizer::new(&model, SAMPLE_RATE.0 as f32).unwrap();
+        let mut recognizer =
+            Recognizer::new_with_grammar(&model, SAMPLE_RATE.0 as f32, words).unwrap();
 
         // recognizer.set_max_alternatives(10);
         recognizer.set_words(true);
@@ -57,7 +70,7 @@ fn main() {
         .expect("no desirable input configs")
         .with_sample_rate(SAMPLE_RATE)
         .config();
-    let mut robot = Box::new(Robot::new());
+    let mut robot = Box::new(Robot::new(GRAMMAR));
 
     let instream = dev
         .build_input_stream(
