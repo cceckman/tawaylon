@@ -3,7 +3,7 @@ use rodio::{
     cpal::{traits::StreamTrait, SampleRate},
     DeviceTrait,
 };
-use vosk::{Model, Recognizer};
+use vosk::{CompleteResult, Model, Recognizer};
 
 const SAMPLE_RATE: SampleRate = SampleRate(16_000);
 
@@ -19,7 +19,7 @@ impl Robot {
 
         let mut recognizer = Recognizer::new(&model, SAMPLE_RATE.0 as f32).unwrap();
 
-        recognizer.set_max_alternatives(10);
+        // recognizer.set_max_alternatives(10);
         recognizer.set_words(true);
         recognizer.set_partial_words(false);
 
@@ -28,7 +28,13 @@ impl Robot {
 
     fn update(&mut self, sample: &[i16], _: &InputCallbackInfo) {
         let state = self.recog.accept_waveform(sample);
-        println!("currently: {:?}", state);
+        if let vosk::DecodingState::Finalized = state {
+            if let CompleteResult::Single(result) = self.recog.final_result() {
+                println!("I heard:\n{}\n", result.text);
+            } else {
+                panic!("multiple results")
+            }
+        }
     }
 }
 
