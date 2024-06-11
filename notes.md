@@ -62,6 +62,19 @@ It _kinda_ works. It interacts oddly with XWayland.
 
 but I'm gonna type like this for a little bit. It didn't work great; and the "correction" modes are tricky / annoying. Bleh. Practice? Better mic?
 
+### Talon: inherent vs. plugin
+
+What things are in the Talon core (closed-source) vs. in plugins?
+
+One way to approach: what things are [part of the API](https://talonvoice.com/docs/index.html#overview)
+vs. part of the [the plugin set](https://github.com/talonhub/community)?
+
+- Clipboard: [API](https://talonvoice.com/docs/index.html#talon.Context.apps)
+- Window state: API -- [app id](https://talonvoice.com/docs/index.html#talon.Context.apps)
+  - VSCode under Wayland: Talon can't see it in plugins to match context
+  - VSCode under XWayland: Talon can see it, activate context
+- Window manipulation: [community](https://github.com/talonhub/community/tree/main/core/windows_and_tabs)
+
 ## whisper.cpp stream example
 
 Took a while to pick things up. VAD only detected the first sample.
@@ -69,6 +82,7 @@ Took a while to pick things up. VAD only detected the first sample.
 ## faster-whisper attempts
 
 ### whisper_streaming
+
 [this](https://github.com/ufal/whisper_streaming) says:
 
 > Default Whisper is intended for audio chunks of at most 30 seconds that contain one full sentence. Longer audio files must be split to shorter chunks and merged with "init prompt". In low latency simultaneous streaming mode, the simple and naive chunking fixed-sized windows does not work well, it can split a word in the middle. It is also necessary to know when the transcribt is stable, should be confirmed ("commited") and followed up, and when the future content makes the transcript clearer.
@@ -89,3 +103,27 @@ Client/server model. Works pretty well for text, saying "air bat cap sit" got me
 This is what Talon uses; now part of Facebook's Flashlight app: [here](https://github.com/flashlight/flashlight/blob/main/flashlight/app/asr/Decode.cpp)
 
 That's a lot less "user friendly" than the Whisper stuff; but may be better for this!
+
+## Sepia STT
+
+https://github.com/SEPIA-Framework/sepia-stt-server/blob/master/python-client/example.py
+
+This is pretty ok; there's quasi-final results, looks like, if the "best transcription" is empty (presumably for the next result?)
+So it does wind up splitting utterances
+
+By default wraps Vosk
+
+## Vosk
+
+...which sits on top of a fork of Kaldi, apparently?
+
+Says Vosk is "offline" but it may be ported to online ~easily, algorithm:
+
+- Append to your audio buffer
+- Re-run inference
+- If in the last N seconds, adding new audio didn't change the inference, "commit" and flush
+
+https://github.com/Bear-03/vosk-rs
+
+"new with grammar", can be constrained
+
