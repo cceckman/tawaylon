@@ -4,16 +4,28 @@ use rodio::{
     cpal::{traits::StreamTrait, SampleRate},
     DeviceTrait,
 };
-use std::{os::fd::AsRawFd, time::Duration};
+use smithay_client_toolkit::seat::keyboard::Keymap;
+use std::{
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    time::Duration,
+};
 use vosk::{CompleteResult, Model, Recognizer};
-use wayland_client::{protocol::*, Connection};
 use wayland_client::{
-    protocol::{wl_display::WlDisplay, wl_seat::WlSeat},
+    protocol::{
+        wl_display::WlDisplay,
+        wl_keyboard::{KeymapFormat, WlKeyboard},
+        wl_seat::WlSeat,
+    },
     QueueHandle,
+};
+use wayland_client::{
+    protocol::{wl_keyboard::KeyState, *},
+    Connection,
 };
 use wayland_client::{Dispatch, EventQueue};
 use wlroots_extra_protocols::virtual_keyboard::v1::client::{
-    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1, *,
+    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+    zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1, *,
 };
 
 const SAMPLE_RATE: SampleRate = SampleRate(16_000);
@@ -32,6 +44,14 @@ struct VirtualKeyboard {
     cancel: Box<dyn Send + FnOnce()>,
 }
 
+/// Information reported from the compositor about a seat's keymap.
+#[derive(Debug)]
+struct KeymapInfo {
+    format: KeymapFormat,
+    fd: OwnedFd,
+    size: u32,
+}
+
 impl VirtualKeyboard {
     pub fn new() -> Self {
         Dispatcher::start()
@@ -47,7 +67,32 @@ impl Drop for VirtualKeyboard {
 }
 
 /// Wayland dispatcher.
-struct Dispatcher {}
+#[derive(Debug)]
+struct Dispatcher {
+    queue_handle: QueueHandle<Self>,
+    seat: Option<WlSeat>,
+    kb_manager: Option<ZwpVirtualKeyboardManagerV1>,
+
+    state: InitKeyboardState,
+}
+
+#[derive(Default, Debug)]
+enum InitKeyboardState {
+    #[default]
+    Nothing,
+    NeedKeymap(WlKeyboard),
+    HaveKeymap(KeymapInfo),
+    HaveKeyboard(ZwpVirtualKeyboardV1),
+}
+
+impl InitKeyboardState {
+    fn needs_keyboard(&self) -> bool {
+        matches!(self, InitKeyboardState::Nothing)
+    }
+    fn needs_keymap(&self) -> bool {
+        matches!(self, InitKeyboardState::NeedKeymap(_))
+    }
+}
 
 impl Dispatcher {
     fn start() -> VirtualKeyboard {
@@ -59,7 +104,12 @@ impl Dispatcher {
         let cancel =
             Box::new(|| tracing::error!("cancellation of wayland loop is not implemented"));
 
-        let dispatcher = Dispatcher {};
+        let dispatcher = Dispatcher {
+            queue_handle: queue_handle.clone(),
+            seat: None,
+            kb_manager: None,
+            state: Default::default(),
+        };
 
         std::thread::spawn(move || dispatcher.run_loop(event_queue, connection, display));
         VirtualKeyboard {
@@ -76,7 +126,9 @@ impl Dispatcher {
     ) {
         // Sync updates from Wayland and updates from ourselves.
         let mut poll = mio::Poll::new().unwrap();
-        // TODO: Create a "wake" event we can use to shut things down.
+        // TODO: Create wake events for:
+        // - Drive forward keypresses
+        // - Shut everything down
         const SHUTDOWN: Token = Token(0);
         const WAYLAND: Token = Token(1);
 
@@ -114,11 +166,50 @@ impl Dispatcher {
         }
     }
 
-    fn add_seat(&mut self, seat: WlSeat) {
-        tracing::info!("got seat {:?}", seat);
-    }
     fn add_kmm(&mut self, kmm: ZwpVirtualKeyboardManagerV1) {
         tracing::info!("got keyboard manager {:?}", kmm);
+        if self.kb_manager.is_none() {
+            self.kb_manager = Some(kmm);
+            self.init_keyboard();
+        }
+    }
+
+    fn add_seat(&mut self, seat: WlSeat) {
+        tracing::info!("got seat {:?}", seat);
+        if self.state.needs_keyboard() {
+            tracing::info!("getting real keyboard");
+            self.state = InitKeyboardState::NeedKeymap(seat.get_keyboard(&self.queue_handle, ()));
+        }
+        if self.seat.is_none() {
+            self.seat = Some(seat);
+        }
+    }
+
+    fn add_keymap_info(&mut self, info: KeymapInfo) {
+        if self.state.needs_keymap() {
+            tracing::info!("got new keymap info {:?}", info);
+            self.state = InitKeyboardState::HaveKeymap(info);
+            self.init_keyboard();
+        }
+    }
+
+    fn init_keyboard(&mut self) {
+        tracing::info!("reevaluating keyboard state");
+        if let (Some(seat), Some(kb_manager), InitKeyboardState::HaveKeymap(km)) =
+            (&self.seat, &self.kb_manager, &self.state)
+        {
+            tracing::info!("creating keyboard");
+            let kb = kb_manager.create_virtual_keyboard(seat, &self.queue_handle, ());
+            // Send a keymap identical to the one actually on the seat.
+            kb.keymap(km.format.into(), km.fd.as_fd(), km.size);
+
+            kb.key(1, 38, KeyState::Pressed.into());
+            kb.key(100, 38, KeyState::Released.into());
+
+            self.state = InitKeyboardState::HaveKeyboard(kb);
+        } else {
+            tracing::info!("not ready for keyboard: {:?}", self)
+        }
     }
 }
 
@@ -132,6 +223,28 @@ impl Dispatch<wl_seat::WlSeat, ()> for Dispatcher {
         _qhandle: &QueueHandle<Self>,
     ) {
         tracing::info!("got seat event: {:?}", event);
+    }
+}
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for Dispatcher {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_keyboard::WlKeyboard,
+        event: <wl_keyboard::WlKeyboard as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        tracing::info!("got keyboard event: {:?}", event);
+        match event {
+            wl_keyboard::Event::Keymap { format, fd, size } => {
+                state.add_keymap_info(KeymapInfo {
+                    format: format.into_result().unwrap(),
+                    fd,
+                    size,
+                });
+            }
+            _ => tracing::debug!("ignored keyboard event"),
+        }
     }
 }
 
@@ -179,6 +292,19 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Dispatcher {
                 _ => {}
             }
         }
+    }
+}
+
+impl Dispatch<ZwpVirtualKeyboardV1, ()> for Dispatcher {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpVirtualKeyboardV1,
+        event: <ZwpVirtualKeyboardV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        tracing::info!("got virtual keyboard event: {:?}", event);
     }
 }
 
