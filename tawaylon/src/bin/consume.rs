@@ -8,9 +8,9 @@ use rodio::{
     DeviceTrait,
 };
 use std::{
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     os::fd::{AsFd, AsRawFd, OwnedFd},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use vosk::{CompleteResult, Model, Recognizer};
 use wayland_client::{
@@ -69,6 +69,7 @@ struct Dispatcher {
     kb_manager: Option<ZwpVirtualKeyboardManagerV1>,
 
     state: InitKeyboardState,
+    count: u32,
 }
 
 #[derive(Default, Debug)]
@@ -76,7 +77,7 @@ enum InitKeyboardState {
     #[default]
     Nothing,
     HaveKeymap(KeymapInfo),
-    HaveKeyboard(ZwpVirtualKeyboardV1, Instant),
+    HaveKeyboard(ZwpVirtualKeyboardV1, KeymapInfo),
 }
 
 impl InitKeyboardState {
@@ -102,6 +103,7 @@ impl Dispatcher {
             keyboard: None,
             kb_manager: None,
             state: Default::default(),
+            count: 0,
         };
 
         std::thread::spawn(move || dispatcher.run_loop(event_queue, connection, display));
@@ -121,6 +123,7 @@ impl Dispatcher {
         poll.registry()
             .register(&mut self.pipe, PIPE_DATA, Interest::READABLE)
             .unwrap();
+        self.pipe.set_nonblocking(true).unwrap();
 
         let queue_handle = event_queue.handle();
         // Invoke the registry to get global events, kick things off.
@@ -137,73 +140,75 @@ impl Dispatcher {
                 .register(&mut fd, WAYLAND, Interest::READABLE)
                 .unwrap();
 
-            // Wait until Wayland socket is ready...
+            // Wait until one of the ports is ready...
             'wayland_wait: loop {
                 let mut events = mio::Events::with_capacity(4);
-                poll.poll(&mut events, Some(Duration::from_secs(1)))
-                    .unwrap();
+                poll.poll(&mut events, None).unwrap();
+                // Just try all of the events.
                 for event in events.iter() {
-                    match event.token() {
-                        PIPE_DATA => {
-                            tracing::info!("woke for input stream");
-                            if event.is_read_closed() {
-                                tracing::info!("input stream closed, shutting down");
-                                return;
-                            }
-                            self.accept_data();
-                            // Dispatch the events that just happened.
-                            event_queue.dispatch_pending(&mut self).unwrap();
+                    if event.token() == WAYLAND {
+                        tracing::info!("breaking for Wayland handling");
+                        break 'wayland_wait;
+                    }
+                    if event.token() == PIPE_DATA {
+                        tracing::info!("woke for input stream");
+                        if event.is_read_closed() {
+                            tracing::info!("input stream closed, shutting down");
+                            return;
                         }
-                        WAYLAND => {
-                            tracing::info!("breaking for Wayland handling");
-                            break 'wayland_wait;
-                        }
-                        _ => {}
                     }
                 }
+                // Accept data even if there isn't any ready.
+                self.accept_data();
+                tracing::info!("dispatching to Wayland");
+                event_queue.dispatch_pending(&mut self).unwrap();
             }
             poll.registry().deregister(&mut fd).unwrap();
-            read_guard.read().unwrap();
+            if let Err(e) = read_guard.read() {
+                tracing::warn!("error in handling read guard: {e}");
+            }
+            tracing::info!("dispatching to Wayland");
             event_queue.dispatch_pending(&mut self).unwrap();
         }
     }
 
     fn accept_data(&mut self) {
-        // Always transact a full codepoint.
-        //
-        // TODO: This is lagging quite a bit behind...
-        // I think I want "level-triggered" rather than "edge-triggered"
-        // maybe? Like, need to flush the whole read buffer?
-        //
-        // TODO: These events aren't showing up in `wev` either.
-        // Do we need to keep the Seat object? ...we do already,
-        // do we need to keep the manager open too?
-        // ...we do already. Hold open a Keyboard as a monitor?
-        let mut bytes: [u8; 4] = [0; 4];
-        self.pipe.read_exact(&mut bytes).unwrap();
-        tracing::info!("read 4 bytes from sender");
-        let u = u32::from_ne_bytes(bytes);
-        tracing::info!("read character: {}", char::from_u32(u).unwrap());
-
-        if let InitKeyboardState::HaveKeyboard(kbd, start) = &self.state {
-            if u >= 'a' as u32 && u <= 'z' as u32 {
-                let offset = u - 'a' as u32;
-                // Empirically, from wev:
-                let code = offset + 38;
-                tracing::info!("running with keycode {}", code);
-                kbd.key(
-                    start.elapsed().as_millis() as u32,
-                    code,
-                    KeyState::Pressed.into(),
-                );
-                kbd.key(
-                    start.elapsed().as_millis() as u32,
-                    code,
-                    KeyState::Released.into(),
-                );
+        // TODO: It doesn't look like there's a great way to do level-triggered with Mio.
+        // Need to rethink the "balancing" behavior some --
+        // we don't want to get stuck processing only one event or the other.
+        // For now, though, we do.
+        loop {
+            // Always transact a full codepoint.
+            //
+            // TODO: These events are going out to Wayland according to WAYLAND_DEBUG=client,
+            // but they aren't _reliably_ being seen / consumed by other apps.
+            // Sometimes they are! At startup, and some other random times?
+            // We aren't seeing them reflected back into WlKeyboard,
+            // but that's ~expected since we don't have a focused surface.
+            let mut bytes: [u8; 4] = [0; 4];
+            match self.pipe.read_exact(&mut bytes) {
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    tracing::info!("Done processing data");
+                    return;
+                }
+                Err(e) => panic!("unexpected error in reading input channel: {}", e),
+                Ok(_) => (),
             }
-        } else {
-            tracing::warn!("keyboard is not ready!");
+            tracing::info!("read 4 bytes from sender");
+            let u = u32::from_ne_bytes(bytes);
+            tracing::info!("read character: {}", char::from_u32(u).unwrap());
+
+            // Empirically, this is the starting point:
+            let code = u - ('a' as u32) + 30;
+            if let InitKeyboardState::HaveKeyboard(kb, km) = &self.state {
+                kb.keymap(km.format.into(), km.fd.as_fd(), km.size);
+                kb.key(self.count, code, KeyState::Pressed.into());
+                self.count += 10;
+                kb.key(self.count, code, KeyState::Released.into());
+                self.count += 10;
+            } else {
+                tracing::warn!("keyboard is not ready!");
+            }
         }
     }
 
@@ -243,8 +248,18 @@ impl Dispatcher {
             let kb = kb_manager.create_virtual_keyboard(seat, &self.queue_handle, ());
             // Send a keymap identical to the one actually on the seat.
             kb.keymap(km.format.into(), km.fd.as_fd(), km.size);
+            kb.key(self.count, 30, KeyState::Pressed.into());
+            self.count += 1;
+            kb.key(self.count, 30, KeyState::Released.into());
+            self.count += 1;
 
-            self.state = InitKeyboardState::HaveKeyboard(kb, Instant::now());
+            let mut newstate = InitKeyboardState::Nothing;
+            std::mem::swap(&mut newstate, &mut self.state);
+            let km = match newstate {
+                InitKeyboardState::HaveKeymap(km) => km,
+                _ => panic!("invalid state"),
+            };
+            self.state = InitKeyboardState::HaveKeyboard(kb, km);
         } else {
             tracing::info!("not ready for keyboard: {:?}", self)
         }

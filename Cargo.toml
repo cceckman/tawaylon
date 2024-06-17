@@ -1,0 +1,6 @@
+[workspace]
+
+members = ["tawaylon", "wlroots-extra-protocols"]
+
+resolver = "2"
+
