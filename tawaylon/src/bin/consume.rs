@@ -1,13 +1,16 @@
-use mio::{Interest, Token};
+use mio::{
+    unix::pipe::{Receiver, Sender},
+    Interest, Token,
+};
 use rodio::{
     cpal::{default_host, traits::HostTrait, InputCallbackInfo, SampleFormat, StreamError},
     cpal::{traits::StreamTrait, SampleRate},
     DeviceTrait,
 };
-use smithay_client_toolkit::seat::keyboard::Keymap;
 use std::{
-    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
-    time::Duration,
+    io::{Read, Write},
+    os::fd::{AsFd, AsRawFd, OwnedFd},
+    time::{Duration, Instant},
 };
 use vosk::{CompleteResult, Model, Recognizer};
 use wayland_client::{
@@ -34,14 +37,12 @@ const GRAMMAR: &[&str] = &[
     "air", "bat", "cap", "drum", "each", "fine", "gust", "harp", "sit", "jury",
     /* nit: they don't have "krunch" in their model, we have to misspell it */ "crunch",
     "look", "made", "near", "odd", "pit", "quench", "red", "sun", "trap", "urge", "vest", "whale",
-    "plex", "yank", "zip", "wake", "sleep", "click",
+    "plex", "yank", "zip",
+    // TODO: Beyond letters!
 ];
 
 struct VirtualKeyboard {
-    queue_handle: QueueHandle<Dispatcher>,
-
-    // Shut down the event loop.
-    cancel: Box<dyn Send + FnOnce()>,
+    pipe: Sender,
 }
 
 /// Information reported from the compositor about a seat's keymap.
@@ -58,19 +59,13 @@ impl VirtualKeyboard {
     }
 }
 
-impl Drop for VirtualKeyboard {
-    fn drop(&mut self) {
-        let mut cancel: Box<dyn Send + FnOnce()> = Box::new(|| {});
-        std::mem::swap(&mut cancel, &mut self.cancel);
-        cancel()
-    }
-}
-
 /// Wayland dispatcher.
 #[derive(Debug)]
 struct Dispatcher {
+    pipe: Receiver,
     queue_handle: QueueHandle<Self>,
     seat: Option<WlSeat>,
+    keyboard: Option<WlKeyboard>,
     kb_manager: Option<ZwpVirtualKeyboardManagerV1>,
 
     state: InitKeyboardState,
@@ -80,17 +75,13 @@ struct Dispatcher {
 enum InitKeyboardState {
     #[default]
     Nothing,
-    NeedKeymap(WlKeyboard),
     HaveKeymap(KeymapInfo),
-    HaveKeyboard(ZwpVirtualKeyboardV1),
+    HaveKeyboard(ZwpVirtualKeyboardV1, Instant),
 }
 
 impl InitKeyboardState {
-    fn needs_keyboard(&self) -> bool {
-        matches!(self, InitKeyboardState::Nothing)
-    }
     fn needs_keymap(&self) -> bool {
-        matches!(self, InitKeyboardState::NeedKeymap(_))
+        matches!(self, InitKeyboardState::Nothing)
     }
 }
 
@@ -101,21 +92,20 @@ impl Dispatcher {
         let display = connection.display();
         let event_queue = connection.new_event_queue();
         let queue_handle = event_queue.handle();
-        let cancel =
-            Box::new(|| tracing::error!("cancellation of wayland loop is not implemented"));
+
+        let (keypipe, waypipe) = mio::unix::pipe::new().unwrap();
 
         let dispatcher = Dispatcher {
+            pipe: waypipe,
             queue_handle: queue_handle.clone(),
             seat: None,
+            keyboard: None,
             kb_manager: None,
             state: Default::default(),
         };
 
         std::thread::spawn(move || dispatcher.run_loop(event_queue, connection, display));
-        VirtualKeyboard {
-            queue_handle,
-            cancel,
-        }
+        VirtualKeyboard { pipe: keypipe }
     }
 
     pub fn run_loop(
@@ -126,11 +116,11 @@ impl Dispatcher {
     ) {
         // Sync updates from Wayland and updates from ourselves.
         let mut poll = mio::Poll::new().unwrap();
-        // TODO: Create wake events for:
-        // - Drive forward keypresses
-        // - Shut everything down
-        const SHUTDOWN: Token = Token(0);
-        const WAYLAND: Token = Token(1);
+        const PIPE_DATA: Token = Token(0);
+        const WAYLAND: Token = Token(2);
+        poll.registry()
+            .register(&mut self.pipe, PIPE_DATA, Interest::READABLE)
+            .unwrap();
 
         let queue_handle = event_queue.handle();
         // Invoke the registry to get global events, kick things off.
@@ -154,8 +144,20 @@ impl Dispatcher {
                     .unwrap();
                 for event in events.iter() {
                     match event.token() {
-                        SHUTDOWN => return,
-                        WAYLAND => break 'wayland_wait,
+                        PIPE_DATA => {
+                            tracing::info!("woke for input stream");
+                            if event.is_read_closed() {
+                                tracing::info!("input stream closed, shutting down");
+                                return;
+                            }
+                            self.accept_data();
+                            // Dispatch the events that just happened.
+                            event_queue.dispatch_pending(&mut self).unwrap();
+                        }
+                        WAYLAND => {
+                            tracing::info!("breaking for Wayland handling");
+                            break 'wayland_wait;
+                        }
                         _ => {}
                     }
                 }
@@ -163,6 +165,45 @@ impl Dispatcher {
             poll.registry().deregister(&mut fd).unwrap();
             read_guard.read().unwrap();
             event_queue.dispatch_pending(&mut self).unwrap();
+        }
+    }
+
+    fn accept_data(&mut self) {
+        // Always transact a full codepoint.
+        //
+        // TODO: This is lagging quite a bit behind...
+        // I think I want "level-triggered" rather than "edge-triggered"
+        // maybe? Like, need to flush the whole read buffer?
+        //
+        // TODO: These events aren't showing up in `wev` either.
+        // Do we need to keep the Seat object? ...we do already,
+        // do we need to keep the manager open too?
+        // ...we do already. Hold open a Keyboard as a monitor?
+        let mut bytes: [u8; 4] = [0; 4];
+        self.pipe.read_exact(&mut bytes).unwrap();
+        tracing::info!("read 4 bytes from sender");
+        let u = u32::from_ne_bytes(bytes);
+        tracing::info!("read character: {}", char::from_u32(u).unwrap());
+
+        if let InitKeyboardState::HaveKeyboard(kbd, start) = &self.state {
+            if u >= 'a' as u32 && u <= 'z' as u32 {
+                let offset = u - 'a' as u32;
+                // Empirically, from wev:
+                let code = offset + 38;
+                tracing::info!("running with keycode {}", code);
+                kbd.key(
+                    start.elapsed().as_millis() as u32,
+                    code,
+                    KeyState::Pressed.into(),
+                );
+                kbd.key(
+                    start.elapsed().as_millis() as u32,
+                    code,
+                    KeyState::Released.into(),
+                );
+            }
+        } else {
+            tracing::warn!("keyboard is not ready!");
         }
     }
 
@@ -176,9 +217,9 @@ impl Dispatcher {
 
     fn add_seat(&mut self, seat: WlSeat) {
         tracing::info!("got seat {:?}", seat);
-        if self.state.needs_keyboard() {
-            tracing::info!("getting real keyboard");
-            self.state = InitKeyboardState::NeedKeymap(seat.get_keyboard(&self.queue_handle, ()));
+        if self.keyboard.is_none() {
+            tracing::info!("getting keyboard input");
+            self.keyboard = Some(seat.get_keyboard(&self.queue_handle, ()));
         }
         if self.seat.is_none() {
             self.seat = Some(seat);
@@ -203,10 +244,7 @@ impl Dispatcher {
             // Send a keymap identical to the one actually on the seat.
             kb.keymap(km.format.into(), km.fd.as_fd(), km.size);
 
-            kb.key(1, 38, KeyState::Pressed.into());
-            kb.key(100, 38, KeyState::Released.into());
-
-            self.state = InitKeyboardState::HaveKeyboard(kb);
+            self.state = InitKeyboardState::HaveKeyboard(kb, Instant::now());
         } else {
             tracing::info!("not ready for keyboard: {:?}", self)
         }
@@ -344,6 +382,17 @@ impl Robot {
         if let vosk::DecodingState::Finalized = state {
             if let CompleteResult::Single(result) = self.recog.final_result() {
                 tracing::info!("got utterance: {}", result.text);
+                for word in result.result {
+                    let (idx, _) = GRAMMAR
+                        .iter()
+                        .enumerate()
+                        .find(|(_, v)| **v == word.word)
+                        .unwrap();
+                    let c: u32 = 'a' as u32 + idx as u32;
+                    tracing::info!("got letter: {}", char::from_u32(c).unwrap());
+                    let b = c.to_le_bytes();
+                    self.keyboard.pipe.write_all(&b).unwrap();
+                }
             } else {
                 panic!("multiple results")
             }
