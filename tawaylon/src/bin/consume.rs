@@ -1,15 +1,20 @@
+use mio::{Interest, Token};
 use rodio::{
     cpal::{default_host, traits::HostTrait, InputCallbackInfo, SampleFormat, StreamError},
     cpal::{traits::StreamTrait, SampleRate},
     DeviceTrait,
 };
-use std::sync::Arc;
-use std::{sync::atomic::AtomicBool, time::Duration};
+use std::{os::fd::AsRawFd, time::Duration};
 use vosk::{CompleteResult, Model, Recognizer};
-use wayland_client::QueueHandle;
 use wayland_client::{protocol::*, Connection};
+use wayland_client::{
+    protocol::{wl_display::WlDisplay, wl_seat::WlSeat},
+    QueueHandle,
+};
 use wayland_client::{Dispatch, EventQueue};
-use wayland_protocols::wp::idle_inhibit::zv1::client::*;
+use wlroots_extra_protocols::virtual_keyboard::v1::client::{
+    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1, *,
+};
 
 const SAMPLE_RATE: SampleRate = SampleRate(16_000);
 
@@ -20,120 +25,130 @@ const GRAMMAR: &[&str] = &[
     "plex", "yank", "zip", "wake", "sleep", "click",
 ];
 
-// Wholeheartedly from https://github.com/mora-unie-youer/wayland-idle-inhibitor/blob/master/src/daemon/state.rs
-struct Insomniac {
-    queue_handle: QueueHandle<Self>,
+struct VirtualKeyboard {
+    queue_handle: QueueHandle<Dispatcher>,
 
-    base_surface: Option<wl_surface::WlSurface>,
-    idle_inhibit_manager: Option<zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1>,
-    idle_inhibitor: Option<zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1>,
+    // Shut down the event loop.
+    cancel: Box<dyn Send + FnOnce()>,
 }
 
-impl Insomniac {
-    pub fn new(event_queue: &mut EventQueue<Self>) -> Self {
-        let mut state = Self {
-            queue_handle: event_queue.handle(),
-
-            base_surface: None,
-            idle_inhibit_manager: None,
-            idle_inhibitor: None,
-        };
-
-        // Initializing Wayland client
-        event_queue.roundtrip(&mut state).unwrap();
-        state
+impl VirtualKeyboard {
+    pub fn new() -> Self {
+        Dispatcher::start()
     }
+}
 
-    pub fn create_idle_inhibitor(&self) -> zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1 {
-        if self.base_surface.is_none() || self.idle_inhibit_manager.is_none() {
-            panic!("Surface and idle inhibit manager were not initialized");
-        }
-
-        let surface = self.base_surface.as_ref().unwrap();
-        let idle_inhibit_manager = self.idle_inhibit_manager.as_ref().unwrap();
-        idle_inhibit_manager.create_inhibitor(surface, &self.queue_handle, ())
+impl Drop for VirtualKeyboard {
+    fn drop(&mut self) {
+        let mut cancel: Box<dyn Send + FnOnce()> = Box::new(|| {});
+        std::mem::swap(&mut cancel, &mut self.cancel);
+        cancel()
     }
+}
 
-    pub fn toggle_idle_inhibit(&mut self) {
-        if let Some(idle_inhibitor) = &self.idle_inhibitor {
-            idle_inhibitor.destroy();
-            self.idle_inhibitor = None;
-        } else {
-            self.idle_inhibitor = Some(self.create_idle_inhibitor());
-        }
-    }
+/// Wayland dispatcher.
+struct Dispatcher {}
 
-    pub fn enable_idle_inhibit(&mut self) {
-        if self.idle_inhibitor.is_none() {
-            self.idle_inhibitor = Some(self.create_idle_inhibitor());
+impl Dispatcher {
+    fn start() -> VirtualKeyboard {
+        // Set up Wayland end:
+        let connection = Connection::connect_to_env().unwrap();
+        let display = connection.display();
+        let event_queue = connection.new_event_queue();
+        let queue_handle = event_queue.handle();
+        let cancel =
+            Box::new(|| tracing::error!("cancellation of wayland loop is not implemented"));
+
+        let dispatcher = Dispatcher {};
+
+        std::thread::spawn(move || dispatcher.run_loop(event_queue, connection, display));
+        VirtualKeyboard {
+            queue_handle,
+            cancel,
         }
     }
 
-    pub fn disable_idle_inhibit(&mut self) {
-        if let Some(idle_inhibitor) = &self.idle_inhibitor {
-            idle_inhibitor.destroy();
-            self.idle_inhibitor = None;
+    pub fn run_loop(
+        mut self,
+        mut event_queue: EventQueue<Self>,
+        _connection: Connection,
+        display: WlDisplay,
+    ) {
+        // Sync updates from Wayland and updates from ourselves.
+        let mut poll = mio::Poll::new().unwrap();
+        // TODO: Create a "wake" event we can use to shut things down.
+        const SHUTDOWN: Token = Token(0);
+        const WAYLAND: Token = Token(1);
+
+        let queue_handle = event_queue.handle();
+        // Invoke the registry to get global events, kick things off.
+        let _registry = display.get_registry(&queue_handle, ());
+
+        // ...and loop!
+        loop {
+            event_queue.flush().unwrap();
+
+            let read_guard = event_queue.prepare_read().unwrap();
+            let raw_read_guard = read_guard.connection_fd().as_raw_fd();
+            let mut fd = mio::unix::SourceFd(&raw_read_guard);
+            poll.registry()
+                .register(&mut fd, WAYLAND, Interest::READABLE)
+                .unwrap();
+
+            // Wait until Wayland socket is ready...
+            'wayland_wait: loop {
+                let mut events = mio::Events::with_capacity(4);
+                poll.poll(&mut events, Some(Duration::from_secs(1)))
+                    .unwrap();
+                for event in events.iter() {
+                    match event.token() {
+                        SHUTDOWN => return,
+                        WAYLAND => break 'wayland_wait,
+                        _ => {}
+                    }
+                }
+            }
+            poll.registry().deregister(&mut fd).unwrap();
+            read_guard.read().unwrap();
+            event_queue.dispatch_pending(&mut self).unwrap();
         }
     }
 
-    pub fn is_enabled(&self) -> bool {
-        self.idle_inhibitor.is_some()
+    fn add_seat(&mut self, seat: WlSeat) {
+        tracing::info!("got seat {:?}", seat);
+    }
+    fn add_kmm(&mut self, kmm: ZwpVirtualKeyboardManagerV1) {
+        tracing::info!("got keyboard manager {:?}", kmm);
     }
 }
 
-impl Dispatch<wl_compositor::WlCompositor, ()> for Insomniac {
+impl Dispatch<wl_seat::WlSeat, ()> for Dispatcher {
     fn event(
-        _: &mut Self,
-        _: &wl_compositor::WlCompositor,
-        _: wl_compositor::Event,
+        _state: &mut Self,
+        _proxy: &wl_seat::WlSeat,
+        event: <wl_seat::WlSeat as wayland_client::Proxy>::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<Self>,
+        _qhandle: &QueueHandle<Self>,
     ) {
-        todo!()
+        tracing::info!("got seat event: {:?}", event);
     }
 }
 
-impl Dispatch<wl_surface::WlSurface, ()> for Insomniac {
+impl Dispatch<ZwpVirtualKeyboardManagerV1, ()> for Dispatcher {
     fn event(
-        _: &mut Self,
-        _: &wl_surface::WlSurface,
-        _: wl_surface::Event,
+        _state: &mut Self,
+        _proxy: &ZwpVirtualKeyboardManagerV1,
+        event: <ZwpVirtualKeyboardManagerV1 as wayland_client::Proxy>::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<Self>,
+        _qhandle: &QueueHandle<Self>,
     ) {
-        todo!()
+        tracing::info!("got keyboard manager event: {:?}", event);
     }
 }
 
-impl Dispatch<zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1, ()> for Insomniac {
-    fn event(
-        _: &mut Self,
-        _: &zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
-        _: zwp_idle_inhibit_manager_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        todo!()
-    }
-}
-
-impl Dispatch<zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1, ()> for Insomniac {
-    fn event(
-        _: &mut Self,
-        _: &zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
-        _: zwp_idle_inhibitor_v1::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        todo!()
-    }
-}
-
-impl Dispatch<wl_registry::WlRegistry, ()> for Insomniac {
+impl Dispatch<wl_registry::WlRegistry, ()> for Dispatcher {
     fn event(
         state: &mut Self,
         registry: &wl_registry::WlRegistry,
@@ -146,15 +161,20 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Insomniac {
             name, interface, ..
         } = event
         {
+            // tracing::info!("got global wl_registry event: {} {}", name, interface);
             match &interface[..] {
-                "wl_compositor" => {
-                    let compositor =
-                        registry.bind::<wl_compositor::WlCompositor, _, _>(name, 1, qh, ());
-                    let surface = compositor.create_surface(qh, ());
-                    state.base_surface = Some(surface);
+                "wl_seat" => {
+                    let seat = registry.bind::<wl_seat::WlSeat, _, _>(
+                        name,
+                        /*version=*/ 1,
+                        qh,
+                        /* udata=*/ (),
+                    );
+                    state.add_seat(seat);
                 }
-                "zwp_idle_inhibit_manager_v1" => {
-                    state.idle_inhibit_manager = Some(registry.bind(name, 1, qh, ()));
+                "zwp_virtual_keyboard_manager_v1" => {
+                    let keyboardmanager = registry.bind::<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1, _, _>(name, 1, qh, ());
+                    state.add_kmm(keyboardmanager);
                 }
                 _ => {}
             }
@@ -164,8 +184,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Insomniac {
 
 struct Robot {
     recog: Recognizer,
-    event_queue: EventQueue<Insomniac>,
-    insomniac: Insomniac,
+    keyboard: VirtualKeyboard,
 }
 
 impl Robot {
@@ -186,18 +205,11 @@ impl Robot {
         recognizer.set_words(true);
         recognizer.set_partial_words(false);
 
-        // Set up Wayland end:
-        let conn = Connection::connect_to_env().unwrap();
-        let display = conn.display();
-        let mut event_queue = conn.new_event_queue();
-        let qh = event_queue.handle();
-        let _registry = display.get_registry(&qh, ());
-        let insomniac = Insomniac::new(&mut event_queue);
+        let keyboard = VirtualKeyboard::new();
 
         Robot {
             recog: recognizer,
-            event_queue,
-            insomniac,
+            keyboard,
         }
     }
 
@@ -205,12 +217,7 @@ impl Robot {
         let state = self.recog.accept_waveform(sample);
         if let vosk::DecodingState::Finalized = state {
             if let CompleteResult::Single(result) = self.recog.final_result() {
-                if result.text == "wake" {
-                    self.insomniac.enable_idle_inhibit()
-                } else if result.text == "sleep" {
-                    self.insomniac.disable_idle_inhibit()
-                }
-                println!("I heard:\n{}\n", result.text);
+                tracing::info!("got utterance: {}", result.text);
             } else {
                 panic!("multiple results")
             }
@@ -225,10 +232,12 @@ fn get_input_device() -> rodio::Device {
 }
 
 fn on_error(err: StreamError) {
-    println!("got error: {}", err);
+    tracing::error!("got input stream error: {}", err)
 }
 
 fn main() {
+    tracing_subscriber::fmt::init();
+
     let dev = get_input_device();
     let config = dev
         .supported_input_configs()
@@ -248,7 +257,6 @@ fn main() {
         )
         .unwrap();
 
-    println!("starting input stream...");
     instream.play().unwrap();
 
     std::thread::sleep(Duration::from_secs(60));

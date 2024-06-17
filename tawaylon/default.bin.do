@@ -1,13 +1,18 @@
 
-
+set -x
 redo-ifchange ../lib/libvosk.so
 
 # TODO: This is a hack
 export RUSTFLAGS="-L$(pwd)/../lib/"
 
-cargo build --bins
-# TODO: Cargo, WTF?
-cp ./target/debug/"$2" "$3"
+EXE=$(cargo build --bin "$2" \
+	--message-format=json \
+	| jq -r 'select(.reason == "compiler-artifact") | select(.executable != null) | .executable')
+cp "$EXE" "$3"
 
-redo-ifchange Cargo.toml $(find src/)
+# Cargo caches pretty okay, so we always rebuild,
+# and then use redo-stamp.
+redo-always
+sha256sum "$3" | redo-stamp
+
 
