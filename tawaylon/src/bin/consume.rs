@@ -160,14 +160,16 @@ impl Dispatcher {
                 }
                 // Accept data even if there isn't any ready.
                 self.accept_data();
-                tracing::info!("dispatching to Wayland");
-                event_queue.dispatch_pending(&mut self).unwrap();
+                tracing::debug!("flushing to Wayland");
+                // Note! dispatch_pending handles _incoming_ requests,
+                // but here we want to flush outbound requests.
+                event_queue.flush().unwrap();
             }
             poll.registry().deregister(&mut fd).unwrap();
             if let Err(e) = read_guard.read() {
                 tracing::warn!("error in handling read guard: {e}");
             }
-            tracing::info!("dispatching to Wayland");
+            tracing::debug!("handling pending Wayland events");
             event_queue.dispatch_pending(&mut self).unwrap();
         }
     }
@@ -179,12 +181,6 @@ impl Dispatcher {
         // For now, though, we do.
         loop {
             // Always transact a full codepoint.
-            //
-            // TODO: These events are going out to Wayland according to WAYLAND_DEBUG=client,
-            // but they aren't _reliably_ being seen / consumed by other apps.
-            // Sometimes they are! At startup, and some other random times?
-            // We aren't seeing them reflected back into WlKeyboard,
-            // but that's ~expected since we don't have a focused surface.
             let mut bytes: [u8; 4] = [0; 4];
             match self.pipe.read_exact(&mut bytes) {
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -194,18 +190,18 @@ impl Dispatcher {
                 Err(e) => panic!("unexpected error in reading input channel: {}", e),
                 Ok(_) => (),
             }
-            tracing::info!("read 4 bytes from sender");
+            tracing::debug!("read 4 bytes from sender");
             let u = u32::from_ne_bytes(bytes);
-            tracing::info!("read character: {}", char::from_u32(u).unwrap());
+            tracing::debug!("read character: {}", char::from_u32(u).unwrap());
 
             // Empirically, this is the starting point:
             let code = u - ('a' as u32) + 30;
             if let InitKeyboardState::HaveKeyboard(kb, km) = &self.state {
                 kb.keymap(km.format.into(), km.fd.as_fd(), km.size);
                 kb.key(self.count, code, KeyState::Pressed.into());
-                self.count += 10;
+                self.count += 100;
                 kb.key(self.count, code, KeyState::Released.into());
-                self.count += 10;
+                self.count += 100;
             } else {
                 tracing::warn!("keyboard is not ready!");
             }
@@ -213,7 +209,7 @@ impl Dispatcher {
     }
 
     fn add_kmm(&mut self, kmm: ZwpVirtualKeyboardManagerV1) {
-        tracing::info!("got keyboard manager {:?}", kmm);
+        tracing::debug!("got keyboard manager {:?}", kmm);
         if self.kb_manager.is_none() {
             self.kb_manager = Some(kmm);
             self.init_keyboard();
@@ -221,9 +217,9 @@ impl Dispatcher {
     }
 
     fn add_seat(&mut self, seat: WlSeat) {
-        tracing::info!("got seat {:?}", seat);
+        tracing::debug!("got seat {:?}", seat);
         if self.keyboard.is_none() {
-            tracing::info!("getting keyboard input");
+            tracing::debug!("getting keyboard input");
             self.keyboard = Some(seat.get_keyboard(&self.queue_handle, ()));
         }
         if self.seat.is_none() {
@@ -233,25 +229,24 @@ impl Dispatcher {
 
     fn add_keymap_info(&mut self, info: KeymapInfo) {
         if self.state.needs_keymap() {
-            tracing::info!("got new keymap info {:?}", info);
+            tracing::debug!("got new keymap info {:?}", info);
             self.state = InitKeyboardState::HaveKeymap(info);
             self.init_keyboard();
         }
     }
 
     fn init_keyboard(&mut self) {
-        tracing::info!("reevaluating keyboard state");
+        tracing::debug!("reevaluating keyboard state");
         if let (Some(seat), Some(kb_manager), InitKeyboardState::HaveKeymap(km)) =
             (&self.seat, &self.kb_manager, &self.state)
         {
             tracing::info!("creating keyboard");
             let kb = kb_manager.create_virtual_keyboard(seat, &self.queue_handle, ());
             // Send a keymap identical to the one actually on the seat.
+            // TODO : We need a synthetic one here --
+            // this gives us e.g. asdfjkl;, while we'd like it to be a mapping from
+            // codepoint to "key"
             kb.keymap(km.format.into(), km.fd.as_fd(), km.size);
-            kb.key(self.count, 30, KeyState::Pressed.into());
-            self.count += 1;
-            kb.key(self.count, 30, KeyState::Released.into());
-            self.count += 1;
 
             let mut newstate = InitKeyboardState::Nothing;
             std::mem::swap(&mut newstate, &mut self.state);
@@ -261,7 +256,7 @@ impl Dispatcher {
             };
             self.state = InitKeyboardState::HaveKeyboard(kb, km);
         } else {
-            tracing::info!("not ready for keyboard: {:?}", self)
+            tracing::warn!("not ready for keyboard: {:?}", self)
         }
     }
 }
@@ -275,7 +270,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for Dispatcher {
         _: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        tracing::info!("got seat event: {:?}", event);
+        tracing::debug!("got seat event: {:?}", event);
     }
 }
 impl Dispatch<wl_keyboard::WlKeyboard, ()> for Dispatcher {
@@ -287,7 +282,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Dispatcher {
         _: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        tracing::info!("got keyboard event: {:?}", event);
+        tracing::debug!("got keyboard event: {:?}", event);
         match event {
             wl_keyboard::Event::Keymap { format, fd, size } => {
                 state.add_keymap_info(KeymapInfo {
@@ -404,7 +399,7 @@ impl Robot {
                         .find(|(_, v)| **v == word.word)
                         .unwrap();
                     let c: u32 = 'a' as u32 + idx as u32;
-                    tracing::info!("got letter: {}", char::from_u32(c).unwrap());
+                    tracing::debug!("got letter: {}", char::from_u32(c).unwrap());
                     let b = c.to_le_bytes();
                     self.keyboard.pipe.write_all(&b).unwrap();
                 }
