@@ -363,7 +363,8 @@ struct Robot {
 
 impl Robot {
     fn new(words: &[impl AsRef<str>]) -> Self {
-        let model_path = "/home/cceckman/r/github.com/cceckman/tawaylon/models/vosk-small.dir";
+        // Assuming we're invoked from redo
+        let model_path = "../models/vosk-small.dir";
 
         let mut model = Model::new(model_path).unwrap();
         for word in words {
