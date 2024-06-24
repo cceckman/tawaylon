@@ -9,7 +9,7 @@ fn audio_samples() -> rodio::Decoder<std::io::Cursor<&'static [u8]>> {
 
 fn main() {
     let samples: Vec<i16> = audio_samples().collect();
-    let model_path = "/home/cceckman/r/github.com/cceckman/tawaylon/models/vosk-small.dir";
+    let model_path = "../models/vosk-small.dir";
 
     let mut model = Model::new(model_path).unwrap();
     model.find_word("hello").expect("could not find hello");
