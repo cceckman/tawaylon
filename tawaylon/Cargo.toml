@@ -6,9 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+memfile = "0.3.2"
 mio = { version = "1.0.0", features = ["os-ext"] }
 rodio = "0.18.1"
 smithay-client-toolkit = "0.19.1"
+tempfile = "3.10.1"
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
 vosk = "0.2.0"

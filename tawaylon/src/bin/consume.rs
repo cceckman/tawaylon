@@ -1,3 +1,4 @@
+use memfile::{CreateOptions, MemFile};
 use mio::{
     unix::pipe::{Receiver, Sender},
     Interest, Token,
@@ -18,6 +19,8 @@ use wayland_client::{
         wl_display::WlDisplay,
         wl_keyboard::{KeymapFormat, WlKeyboard},
         wl_seat::WlSeat,
+        wl_shm::WlShm,
+        wl_shm_pool::WlShmPool,
     },
     QueueHandle,
 };
@@ -30,6 +33,17 @@ use wlroots_extra_protocols::virtual_keyboard::v1::client::{
     zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1, *,
 };
+
+use tawaylon::keymap::get_temp_keymap;
+
+/// Generate a keycode for a character.
+/// Our keymap maps keycodes as ASCII, so this is just a unity mapping.
+fn make_keycode(c: u32) -> u32 {
+    // I...don't know why we have to do this.
+    // I had removed the `minimum = 8` statement from the keymap.
+    // So...this is some sort of an arbitrary offset?
+    c - 8
+}
 
 const SAMPLE_RATE: SampleRate = SampleRate(16_000);
 
@@ -67,6 +81,10 @@ struct Dispatcher {
     seat: Option<WlSeat>,
     keyboard: Option<WlKeyboard>,
     kb_manager: Option<ZwpVirtualKeyboardManagerV1>,
+    shm_pool: Option<WlShmPool>,
+
+    memfile: MemFile,
+    keymap: KeymapInfo,
 
     state: InitKeyboardState,
     count: u32,
@@ -76,14 +94,7 @@ struct Dispatcher {
 enum InitKeyboardState {
     #[default]
     Nothing,
-    HaveKeymap(KeymapInfo),
-    HaveKeyboard(ZwpVirtualKeyboardV1, KeymapInfo),
-}
-
-impl InitKeyboardState {
-    fn needs_keymap(&self) -> bool {
-        matches!(self, InitKeyboardState::Nothing)
-    }
+    HaveKeyboard(ZwpVirtualKeyboardV1),
 }
 
 impl Dispatcher {
@@ -96,11 +107,22 @@ impl Dispatcher {
 
         let (keypipe, waypipe) = mio::unix::pipe::new().unwrap();
 
+        let keymap = Self::make_keymap_info();
+        let memfile = CreateOptions::new()
+            .create("wl_shm")
+            .expect("could not create shared memory pool");
+        memfile
+            .set_len(4 * 1024 * 1024)
+            .expect("could not resize pool");
+
         let dispatcher = Dispatcher {
             pipe: waypipe,
             queue_handle: queue_handle.clone(),
             seat: None,
             keyboard: None,
+            keymap,
+            memfile,
+            shm_pool: None,
             kb_manager: None,
             state: Default::default(),
             count: 0,
@@ -192,12 +214,20 @@ impl Dispatcher {
             }
             tracing::debug!("read 4 bytes from sender");
             let u = u32::from_ne_bytes(bytes);
-            tracing::debug!("read character: {}", char::from_u32(u).unwrap());
+            let code = make_keycode(u);
+            tracing::debug!(
+                "read character: {} / {} / {}",
+                u,
+                char::from_u32(u).unwrap(),
+                code
+            );
 
-            // Empirically, this is the starting point:
-            let code = u - ('a' as u32) + 30;
-            if let InitKeyboardState::HaveKeyboard(kb, km) = &self.state {
-                kb.keymap(km.format.into(), km.fd.as_fd(), km.size);
+            if let InitKeyboardState::HaveKeyboard(kb) = &self.state {
+                kb.keymap(
+                    self.keymap.format.into(),
+                    self.keymap.fd.as_fd(),
+                    self.keymap.size,
+                );
                 kb.key(self.count, code, KeyState::Pressed.into());
                 self.count += 100;
                 kb.key(self.count, code, KeyState::Released.into());
@@ -225,39 +255,107 @@ impl Dispatcher {
         if self.seat.is_none() {
             self.seat = Some(seat);
         }
+        // Check if we fulfilled our last dependency
+        self.init_keyboard();
     }
 
-    fn add_keymap_info(&mut self, info: KeymapInfo) {
-        if self.state.needs_keymap() {
-            tracing::debug!("got new keymap info {:?}", info);
-            self.state = InitKeyboardState::HaveKeymap(info);
-            self.init_keyboard();
+    fn add_shm(&mut self, shm: WlShm, qh: &QueueHandle<Self>) {
+        tracing::debug!("got shared memory manager{:?}", shm);
+        if self.shm_pool.is_none() {
+            let len = self
+                .memfile
+                .metadata()
+                .expect("could not get memfile metadata")
+                .len();
+            tracing::info!("sharing memory pool of size {}", len);
+            // Create a pool to use for buffers
+            self.shm_pool = Some(shm.create_pool(self.memfile.as_fd(), len as i32, qh, ()));
         }
+        self.init_keyboard();
+    }
+
+    fn make_keymap_info() -> KeymapInfo {
+        tracing::debug!("creating keymap file");
+        let kmfile = get_temp_keymap().expect("failed to prepare keymap");
+        let size = kmfile
+            .metadata()
+            .expect("could not key keymap metadata")
+            .len() as u32;
+        let fd: OwnedFd = kmfile.into();
+        let info = KeymapInfo {
+            format: KeymapFormat::XkbV1,
+            fd,
+            size,
+        };
+
+        tracing::debug!("generated keymap info {:?}", info);
+        info
     }
 
     fn init_keyboard(&mut self) {
         tracing::debug!("reevaluating keyboard state");
-        if let (Some(seat), Some(kb_manager), InitKeyboardState::HaveKeymap(km)) =
-            (&self.seat, &self.kb_manager, &self.state)
+        // WLRoots types/wlr_virtual_keyboard_v1.c has the
+        // function virtual_keyboard_keymap.
+        // In any of cleanup paths (keymap_fail, fd_fail, context_fail),
+        // it reports wl_client_post_no_memory.
+        // We see that...always. How can it fail?
+        // - xkb_context_new. Does this only exist if we have a keymap?
+        // - mmap fail. This is almost certainly OK.
+        // - xkb_keymap_new_from_string. This is *likely* where we fail--
+        //   if our keymap isn't valid we're screwed.
+        //
+        // Yes, keymap had syntactic errors.
+        // So what of these do we actually need?
+        if let (Some(seat), Some(kb_manager), Some(_), Some(_)) =
+            (&self.seat, &self.kb_manager, &self.shm_pool, &self.keyboard)
         {
             tracing::info!("creating keyboard");
             let kb = kb_manager.create_virtual_keyboard(seat, &self.queue_handle, ());
             // Send a keymap identical to the one actually on the seat.
-            // TODO : We need a synthetic one here --
-            // this gives us e.g. asdfjkl;, while we'd like it to be a mapping from
-            // codepoint to "key"
-            kb.keymap(km.format.into(), km.fd.as_fd(), km.size);
+            // TODO: This fails with "no memory".
+            // I wonder if we have to allocate e.g. a shared-memory pool first?
+            // I've had this work when it's an FD already-shared in the host...
+            // or "wl_shm::create_pool"?
+            // TODO: add this back, working on SHM
+            kb.keymap(
+                self.keymap.format.into(),
+                self.keymap.fd.as_fd(),
+                self.keymap.size,
+            );
 
             let mut newstate = InitKeyboardState::Nothing;
             std::mem::swap(&mut newstate, &mut self.state);
-            let km = match newstate {
-                InitKeyboardState::HaveKeymap(km) => km,
-                _ => panic!("invalid state"),
-            };
-            self.state = InitKeyboardState::HaveKeyboard(kb, km);
+            self.state = InitKeyboardState::HaveKeyboard(kb);
+            tracing::info!("READY!!!!");
         } else {
             tracing::warn!("not ready for keyboard: {:?}", self)
         }
+    }
+}
+
+impl Dispatch<wl_shm::WlShm, ()> for Dispatcher {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_shm::WlShm,
+        event: <wl_shm::WlShm as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        tracing::debug!("got shared memory event: {:?}", event);
+    }
+}
+
+impl Dispatch<wl_shm_pool::WlShmPool, ()> for Dispatcher {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_shm_pool::WlShmPool,
+        event: <wl_shm_pool::WlShmPool as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        tracing::debug!("got shared memory pool event: {:?}", event);
     }
 }
 
@@ -273,9 +371,10 @@ impl Dispatch<wl_seat::WlSeat, ()> for Dispatcher {
         tracing::debug!("got seat event: {:?}", event);
     }
 }
+
 impl Dispatch<wl_keyboard::WlKeyboard, ()> for Dispatcher {
     fn event(
-        state: &mut Self,
+        _state: &mut Self,
         _proxy: &wl_keyboard::WlKeyboard,
         event: <wl_keyboard::WlKeyboard as wayland_client::Proxy>::Event,
         _: &(),
@@ -283,16 +382,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Dispatcher {
         _qhandle: &QueueHandle<Self>,
     ) {
         tracing::debug!("got keyboard event: {:?}", event);
-        match event {
-            wl_keyboard::Event::Keymap { format, fd, size } => {
-                state.add_keymap_info(KeymapInfo {
-                    format: format.into_result().unwrap(),
-                    fd,
-                    size,
-                });
-            }
-            _ => tracing::debug!("ignored keyboard event"),
-        }
     }
 }
 
@@ -322,6 +411,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Dispatcher {
             name, interface, ..
         } = event
         {
+            tracing::debug!("got registry entry: {interface}");
             // tracing::info!("got global wl_registry event: {} {}", name, interface);
             match &interface[..] {
                 "wl_seat" => {
@@ -332,6 +422,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Dispatcher {
                         /* udata=*/ (),
                     );
                     state.add_seat(seat);
+                }
+                "wl_shm" => {
+                    // Shared memory manager is a global singleton.
+                    let shm = registry.bind::<wl_shm::WlShm, _, _>(
+                        name,
+                        /*version=*/ 1,
+                        qh,
+                        /* udata=*/ (),
+                    );
+                    state.add_shm(shm, qh);
                 }
                 "zwp_virtual_keyboard_manager_v1" => {
                     let keyboardmanager = registry.bind::<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1, _, _>(name, 1, qh, ());
