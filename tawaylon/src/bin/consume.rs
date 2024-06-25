@@ -31,6 +31,21 @@ use wlroots_extra_protocols::virtual_keyboard::v1::client::{
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1, *,
 };
 
+/// Generate a keycode for a character per http://microvga.com/ansi-keycodes
+fn make_keycode(c: u32) -> u32 {
+    match c {
+        // 'a' to 'z'
+        0x61..=0x7A => {
+            let offset = c - 0x61;
+            offset + 97
+        }
+        _ => {
+            println!("unmatched character: {c}");
+            0
+        }
+    }
+}
+
 const SAMPLE_RATE: SampleRate = SampleRate(16_000);
 
 const GRAMMAR: &[&str] = &[
@@ -195,7 +210,7 @@ impl Dispatcher {
             tracing::debug!("read character: {}", char::from_u32(u).unwrap());
 
             // Empirically, this is the starting point:
-            let code = u - ('a' as u32) + 30;
+            let code = make_keycode(u);
             if let InitKeyboardState::HaveKeyboard(kb, km) = &self.state {
                 kb.keymap(km.format.into(), km.fd.as_fd(), km.size);
                 kb.key(self.count, code, KeyState::Pressed.into());
