@@ -47,12 +47,18 @@ fn make_keycode(c: u32) -> u32 {
 
 const SAMPLE_RATE: SampleRate = SampleRate(16_000);
 
-const GRAMMAR: &[&str] = &[
+const LETTERS: &[&str] = &[
     "air", "bat", "cap", "drum", "each", "fine", "gust", "harp", "sit", "jury",
     /* nit: they don't have "krunch" in their model, we have to misspell it */ "crunch",
     "look", "made", "near", "odd", "pit", "quench", "red", "sun", "trap", "urge", "vest", "whale",
     "plex", "yank", "zip",
-    // TODO: Beyond letters!
+];
+const NUMBERS: &[&str] = &[
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+];
+
+const ORDINALS: &[&str] = &[
+    "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth",
 ];
 
 struct VirtualKeyboard {
@@ -494,15 +500,30 @@ impl Robot {
             if let CompleteResult::Single(result) = self.recog.final_result() {
                 tracing::info!("got utterance: {}", result.text);
                 for word in result.result {
-                    let (idx, _) = GRAMMAR
-                        .iter()
-                        .enumerate()
-                        .find(|(_, v)| **v == word.word)
-                        .unwrap();
-                    let c: u32 = 'a' as u32 + idx as u32;
-                    tracing::debug!("got letter: {}", char::from_u32(c).unwrap());
-                    let b = c.to_le_bytes();
-                    self.keyboard.pipe.write_all(&b).unwrap();
+                    // TODO: This could be a map lookup
+                    if let Some((idx, _)) =
+                        LETTERS.iter().enumerate().find(|(_, v)| **v == word.word)
+                    {
+                        let c: u32 = 'a' as u32 + idx as u32;
+                        tracing::debug!("got letter: {}", char::from_u32(c).unwrap());
+                        let b = c.to_le_bytes();
+                        self.keyboard.pipe.write_all(&b).unwrap();
+                    }
+                    if let Some((idx, _)) =
+                        NUMBERS.iter().enumerate().find(|(_, v)| **v == word.word)
+                    {
+                        let c: u32 = '0' as u32 + idx as u32;
+                        tracing::debug!("got number: {}", char::from_u32(c).unwrap());
+                        let b = c.to_le_bytes();
+                        self.keyboard.pipe.write_all(&b).unwrap();
+                    }
+                    if let Some((idx, _)) =
+                        ORDINALS.iter().enumerate().find(|(_, v)| **v == word.word)
+                    {
+                        let c: u32 = '0' as u32 + idx as u32;
+                        tracing::debug!("got ordinal: {}", char::from_u32(c).unwrap());
+                        // TODO: implement ordinals
+                    }
                 }
             } else {
                 panic!("multiple results")
@@ -532,7 +553,12 @@ fn main() {
         .expect("no desirable input configs")
         .with_sample_rate(SAMPLE_RATE)
         .config();
-    let mut robot = Box::new(Robot::new(GRAMMAR));
+
+    let lt = LETTERS.iter().cloned();
+    let nu = NUMBERS.iter().cloned();
+    let or = ORDINALS.iter().cloned();
+    let grammar: Vec<&str> = lt.chain(nu).chain(or).collect();
+    let mut robot = Box::new(Robot::new(&grammar));
 
     let instream = dev
         .build_input_stream(
