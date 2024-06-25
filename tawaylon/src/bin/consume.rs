@@ -31,19 +31,12 @@ use wlroots_extra_protocols::virtual_keyboard::v1::client::{
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1, *,
 };
 
-/// Generate a keycode for a character per http://microvga.com/ansi-keycodes
+use tawaylon::keymap::get_temp_keymap;
+
+/// Generate a keycode for a character.
+/// Our keymap maps keycodes as ASCII, so this is just a unity mapping.
 fn make_keycode(c: u32) -> u32 {
-    match c {
-        // 'a' to 'z'
-        0x61..=0x7A => {
-            let offset = c - 0x61;
-            offset + 97
-        }
-        _ => {
-            println!("unmatched character: {c}");
-            0
-        }
-    }
+    return c;
 }
 
 const SAMPLE_RATE: SampleRate = SampleRate(16_000);
@@ -240,27 +233,46 @@ impl Dispatcher {
         if self.seat.is_none() {
             self.seat = Some(seat);
         }
+        // Check if we fulfilled our last dependency
+        self.init_keyboard();
     }
 
-    fn add_keymap_info(&mut self, info: KeymapInfo) {
+    fn add_keymap_info(&mut self) {
         if self.state.needs_keymap() {
-            tracing::debug!("got new keymap info {:?}", info);
+            tracing::debug!("creating keymap file");
+            let kmfile = get_temp_keymap().expect("failed to prepare keymap");
+            let size = kmfile
+                .metadata()
+                .expect("could not key keymap metadata")
+                .len() as u32;
+            let fd: OwnedFd = kmfile.into();
+            let info = KeymapInfo {
+                format: KeymapFormat::XkbV1,
+                fd,
+                size,
+            };
+
+            tracing::debug!("generated keymap info {:?}", info);
             self.state = InitKeyboardState::HaveKeymap(info);
-            self.init_keyboard();
+        } else {
+            tracing::debug!("keymap file already exists");
         }
     }
 
     fn init_keyboard(&mut self) {
         tracing::debug!("reevaluating keyboard state");
+        // Init the keymap if needed
+        self.add_keymap_info();
         if let (Some(seat), Some(kb_manager), InitKeyboardState::HaveKeymap(km)) =
             (&self.seat, &self.kb_manager, &self.state)
         {
             tracing::info!("creating keyboard");
             let kb = kb_manager.create_virtual_keyboard(seat, &self.queue_handle, ());
             // Send a keymap identical to the one actually on the seat.
-            // TODO : We need a synthetic one here --
-            // this gives us e.g. asdfjkl;, while we'd like it to be a mapping from
-            // codepoint to "key"
+            // TODO: This fails with "no memory".
+            // I wonder if we have to allocate e.g. a shared-memory pool first?
+            // I've had this work when it's an FD already-shared in the host...
+            // or "wl_shm::create_pool"?
             kb.keymap(km.format.into(), km.fd.as_fd(), km.size);
 
             let mut newstate = InitKeyboardState::Nothing;
@@ -270,6 +282,7 @@ impl Dispatcher {
                 _ => panic!("invalid state"),
             };
             self.state = InitKeyboardState::HaveKeyboard(kb, km);
+            tracing::info!("READY!!!!");
         } else {
             tracing::warn!("not ready for keyboard: {:?}", self)
         }
@@ -288,9 +301,10 @@ impl Dispatch<wl_seat::WlSeat, ()> for Dispatcher {
         tracing::debug!("got seat event: {:?}", event);
     }
 }
+
 impl Dispatch<wl_keyboard::WlKeyboard, ()> for Dispatcher {
     fn event(
-        state: &mut Self,
+        _state: &mut Self,
         _proxy: &wl_keyboard::WlKeyboard,
         event: <wl_keyboard::WlKeyboard as wayland_client::Proxy>::Event,
         _: &(),
@@ -298,16 +312,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Dispatcher {
         _qhandle: &QueueHandle<Self>,
     ) {
         tracing::debug!("got keyboard event: {:?}", event);
-        match event {
-            wl_keyboard::Event::Keymap { format, fd, size } => {
-                state.add_keymap_info(KeymapInfo {
-                    format: format.into_result().unwrap(),
-                    fd,
-                    size,
-                });
-            }
-            _ => tracing::debug!("ignored keyboard event"),
-        }
     }
 }
 
