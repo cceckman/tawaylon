@@ -9,7 +9,7 @@ use tempfile;
 ///
 /// Specifically, we're trying to generate a keymap where each keycode
 /// matches its Unicode codepoint. :)
-fn make_keymap() -> String {
+pub fn make_keymap() -> String {
     let mut keycodes = String::new();
     let mut symbols = String::new();
 
@@ -17,7 +17,7 @@ fn make_keymap() -> String {
         let code = i + '0' as u32;
         keycodes += &format!(
             r#"
-    <N{i}> = {code}
+    <N{i}> = {code};
 "#
         );
         symbols += &format!(
@@ -49,7 +49,7 @@ fn make_keymap() -> String {
         r#"
 xkb_keymap {{
 xkb_keycodes "alphabetic" {{
-    minimum = 8;
+    minimum = 0;
     maximum = 255;
     {keycodes}
 }};

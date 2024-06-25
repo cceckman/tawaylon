@@ -39,7 +39,10 @@ use tawaylon::keymap::get_temp_keymap;
 /// Generate a keycode for a character.
 /// Our keymap maps keycodes as ASCII, so this is just a unity mapping.
 fn make_keycode(c: u32) -> u32 {
-    c
+    // I...don't know why we have to do this.
+    // I had removed the `minimum = 8` statement from the keymap.
+    // So...this is some sort of an arbitrary offset?
+    c - 8
 }
 
 const SAMPLE_RATE: SampleRate = SampleRate(16_000);
@@ -211,9 +214,14 @@ impl Dispatcher {
             }
             tracing::debug!("read 4 bytes from sender");
             let u = u32::from_ne_bytes(bytes);
-            tracing::debug!("read character: {}", char::from_u32(u).unwrap());
-
             let code = make_keycode(u);
+            tracing::debug!(
+                "read character: {} / {} / {}",
+                u,
+                char::from_u32(u).unwrap(),
+                code
+            );
+
             if let InitKeyboardState::HaveKeyboard(kb) = &self.state {
                 kb.keymap(
                     self.keymap.format.into(),
@@ -286,9 +294,20 @@ impl Dispatcher {
 
     fn init_keyboard(&mut self) {
         tracing::debug!("reevaluating keyboard state");
-        // Init the keymap if needed
-        if let (Some(seat), Some(kb_manager), Some(_)) =
-            (&self.seat, &self.kb_manager, &self.shm_pool)
+        // WLRoots types/wlr_virtual_keyboard_v1.c has the
+        // function virtual_keyboard_keymap.
+        // In any of cleanup paths (keymap_fail, fd_fail, context_fail),
+        // it reports wl_client_post_no_memory.
+        // We see that...always. How can it fail?
+        // - xkb_context_new. Does this only exist if we have a keymap?
+        // - mmap fail. This is almost certainly OK.
+        // - xkb_keymap_new_from_string. This is *likely* where we fail--
+        //   if our keymap isn't valid we're screwed.
+        //
+        // Yes, keymap had syntactic errors.
+        // So what of these do we actually need?
+        if let (Some(seat), Some(kb_manager), Some(_), Some(_)) =
+            (&self.seat, &self.kb_manager, &self.shm_pool, &self.keyboard)
         {
             tracing::info!("creating keyboard");
             let kb = kb_manager.create_virtual_keyboard(seat, &self.queue_handle, ());
