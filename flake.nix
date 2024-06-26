@@ -10,20 +10,18 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
-      in {
+      in rec {
         packages = {
           default = pkgs.writeShellScriptBin "build.sh" ''
-            LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
+            export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
+              pkgs.stdenv.cc.cc.lib
               pkgs.alsa-lib
               pkgs.libxkbcommon
-              pkgs.libstdcxx5
             ]}
-            PKG_CONFIG_PATH=${pkgs.lib.makeLibraryPath [
+            export PKG_CONFIG_PATH=${pkgs.lib.makeLibraryPath [
               pkgs.alsa-lib 
-              "${pkgs.alsa-lib.dev}/pkgconfig"
-            ]}
-            ${pkgs.lib.makeBinPath [
-              pkgs.libxkbcommon
+            ]}:${pkgs.alsa-lib.dev}/lib/pkgconfig:${pkgs.libxkbcommon.dev}/lib/pkgconfig
+            PATH=$PATH:${pkgs.lib.makeBinPath [
               pkgs.stdenv.cc.cc.lib
               pkgs.rust-analyzer
               pkgs.python3
@@ -35,23 +33,7 @@
         };
         devShells = {
           default = pkgs.mkShell { 
-            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ 
-              pkgs.alsa-lib
-              pkgs.libxkbcommon
-              pkgs.libstdcxx5
-            ];
-            PKG_CONFIG_PATH = pkgs.lib.makeLibraryPath [
-              pkgs.alsa-lib 
-              "${pkgs.alsa-lib.dev}/pkgconfig"
-            ];
-            buildInputs = [
-              pkgs.libxkbcommon
-              pkgs.stdenv.cc.cc.lib
-              pkgs.rust-analyzer
-              pkgs.python3
-              pkgs.unzip
-              pkgs.cargo
-            ];
+            inputsFrom = [ packages.default ];
           };
         };
       });
