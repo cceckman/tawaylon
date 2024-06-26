@@ -16,10 +16,7 @@ use std::{
 use vosk::{CompleteResult, Model, Recognizer};
 use wayland_client::{
     protocol::{
-        wl_display::WlDisplay,
-        wl_keyboard::{KeymapFormat, WlKeyboard},
-        wl_seat::WlSeat,
-        wl_shm::WlShm,
+        wl_display::WlDisplay, wl_keyboard::KeymapFormat, wl_seat::WlSeat, wl_shm::WlShm,
         wl_shm_pool::WlShmPool,
     },
     QueueHandle,
@@ -79,7 +76,6 @@ struct Dispatcher {
     pipe: Receiver,
     queue_handle: QueueHandle<Self>,
     seat: Option<WlSeat>,
-    keyboard: Option<WlKeyboard>,
     kb_manager: Option<ZwpVirtualKeyboardManagerV1>,
     shm_pool: Option<WlShmPool>,
 
@@ -119,7 +115,6 @@ impl Dispatcher {
             pipe: waypipe,
             queue_handle: queue_handle.clone(),
             seat: None,
-            keyboard: None,
             keymap,
             memfile,
             shm_pool: None,
@@ -248,10 +243,6 @@ impl Dispatcher {
 
     fn add_seat(&mut self, seat: WlSeat) {
         tracing::debug!("got seat {:?}", seat);
-        if self.keyboard.is_none() {
-            tracing::debug!("getting keyboard input");
-            self.keyboard = Some(seat.get_keyboard(&self.queue_handle, ()));
-        }
         if self.seat.is_none() {
             self.seat = Some(seat);
         }
@@ -306,8 +297,8 @@ impl Dispatcher {
         //
         // Yes, keymap had syntactic errors.
         // So what of these do we actually need?
-        if let (Some(seat), Some(kb_manager), Some(_), Some(_)) =
-            (&self.seat, &self.kb_manager, &self.shm_pool, &self.keyboard)
+        if let (Some(seat), Some(kb_manager), Some(_)) =
+            (&self.seat, &self.kb_manager, &self.shm_pool)
         {
             tracing::info!("creating keyboard");
             let kb = kb_manager.create_virtual_keyboard(seat, &self.queue_handle, ());
@@ -369,19 +360,6 @@ impl Dispatch<wl_seat::WlSeat, ()> for Dispatcher {
         _qhandle: &QueueHandle<Self>,
     ) {
         tracing::debug!("got seat event: {:?}", event);
-    }
-}
-
-impl Dispatch<wl_keyboard::WlKeyboard, ()> for Dispatcher {
-    fn event(
-        _state: &mut Self,
-        _proxy: &wl_keyboard::WlKeyboard,
-        event: <wl_keyboard::WlKeyboard as wayland_client::Proxy>::Event,
-        _: &(),
-        _: &Connection,
-        _qhandle: &QueueHandle<Self>,
-    ) {
-        tracing::debug!("got keyboard event: {:?}", event);
     }
 }
 
