@@ -10,27 +10,48 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
-      in rec {
-        requiredEnvs = ''
-          PKG_CONFIG_PATH=$PKG_CONFIG_PATH:${pkgs.alsa-lib.dev}/lib/pkgconfig;
-          PKG_CONFIG_PATH=$PKG_CONFIG_PATH:${pkgs.libxkbcommon.dev}/lib/pkgconfig;
-
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${pkgs.alsa-lib}/lib;
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${pkgs.libxkbcommon}/lib;
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${pkgs.stdenv.cc.cc}/lib
-        '';
+      in {
         packages = {
-          default = { };
+          default = pkgs.writeShellScriptBin "build.sh" ''
+            LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
+              pkgs.alsa-lib
+              pkgs.libxkbcommon
+              pkgs.libstdcxx5
+            ]}
+            PKG_CONFIG_PATH=${pkgs.lib.makeLibraryPath [
+              pkgs.alsa-lib 
+              "${pkgs.alsa-lib.dev}/pkgconfig"
+            ]}
+            ${pkgs.lib.makeBinPath [
+              pkgs.libxkbcommon
+              pkgs.stdenv.cc.cc.lib
+              pkgs.rust-analyzer
+              pkgs.python3
+              pkgs.unzip
+              pkgs.cargo
+            ]}
+            ./do tawaylon/run
+          '';
         };
         devShells = {
           default = pkgs.mkShell { 
-            shellHook = requiredEnvs;
-            buildInputs = [pkgs.stdenv.cc.cc.lib];
-            packages = [ 
-              pkgs.unzip
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ 
+              pkgs.alsa-lib
+              pkgs.libxkbcommon
+              pkgs.libstdcxx5
+            ];
+            PKG_CONFIG_PATH = pkgs.lib.makeLibraryPath [
+              pkgs.alsa-lib 
+              "${pkgs.alsa-lib.dev}/pkgconfig"
+            ];
+            buildInputs = [
+              pkgs.libxkbcommon
+              pkgs.stdenv.cc.cc.lib
               pkgs.rust-analyzer
+              pkgs.python3
+              pkgs.unzip
               pkgs.cargo
-            ]; 
+            ];
           };
         };
       });
