@@ -1,6 +1,6 @@
 
 set -x
-redo-ifchange ../lib/libvosk.so
+redo-ifchange ../lib/libvosk.so ../models/vosk-small.zip
 
 # TODO: This is a hack
 export RUSTFLAGS="-L$(pwd)/../lib/"
